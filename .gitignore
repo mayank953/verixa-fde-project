@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/
+*.log
+.DS_Store
+node_modules/
+# Generated reports
+reports/
+*.pdf

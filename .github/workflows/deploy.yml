@@ -1,0 +1,573 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: your-gcp-project-id   # replace with your own project ID
+  REGION: us-central1
+  ZONE: us-central1-a
+  VM_NAME: fraud-server
+  VM_TYPE: e2-medium
+  SQL_INSTANCE: fraud-postgres
+  SQL_TIER: db-f1-micro
+  SQL_DB: fraud_db
+  SQL_USER: fraud_user
+  APP_DIR: fraud-detection-mcp
+  APP_PORT: '8000'
+  NEO4J_HTTP_PORT: '7474'
+  NEO4J_BOLT_PORT: '7687'
+  SQL_PORT: '5432'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  # ══════════════════════════════════════════════════════
+  # JOB 1 — Provision Infrastructure
+  # ══════════════════════════════════════════════════════
+  provision:
+    name: Provision GCP Infrastructure
+    runs-on: ubuntu-latest
+    env:
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      SQL_ROOT_PASSWORD: ${{ secrets.SQL_ROOT_PASSWORD }}
+      SQL_USER_PASSWORD: ${{ secrets.SQL_USER_PASSWORD }}
+      NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Enable required APIs
+        run: |
+          gcloud services enable compute.googleapis.com \
+            sqladmin.googleapis.com \
+            secretmanager.googleapis.com \
+            --project=${{ env.PROJECT_ID }}
+
+      # ── GCE VM ──────────────────────────────────────
+      - name: Ensure VM is running (create or start)
+        run: |
+          STATUS=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(status)" \
+            --project=${{ env.PROJECT_ID }} 2>/dev/null || echo "NOT_FOUND")
+
+          echo "VM Status: $STATUS"
+
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "VM does not exist — creating..."
+            gcloud compute instances create ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --machine-type=${{ env.VM_TYPE }} \
+              --image-family=debian-12 \
+              --image-project=debian-cloud \
+              --boot-disk-size=30GB \
+              --boot-disk-type=pd-standard \
+              --tags=fraud-server \
+              --scopes=https://www.googleapis.com/auth/cloud-platform \
+              --project=${{ env.PROJECT_ID }}
+            echo "Waiting 40s for VM to boot..."
+            sleep 40
+
+          elif [ "$STATUS" = "TERMINATED" ] || [ "$STATUS" = "STOPPED" ]; then
+            echo "VM is stopped — starting..."
+            gcloud compute instances start ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }}
+            echo "Waiting 30s for VM to come online..."
+            sleep 30
+
+          elif [ "$STATUS" = "STAGING" ] || [ "$STATUS" = "PROVISIONING" ]; then
+            echo "VM is booting — waiting 30s..."
+            sleep 30
+
+          else
+            echo "VM is $STATUS — ready to deploy"
+          fi
+
+      # FIX 1: SSH key setup — write private key + derive public key
+      # Must be done in every job since each job runs on a fresh runner
+      - name: Setup SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ env.GCP_SSH_PRIVATE_KEY }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > /tmp/gcp_deploy
+          echo "" >> /tmp/gcp_deploy
+          chmod 600 /tmp/gcp_deploy
+          ssh-keygen -y -f /tmp/gcp_deploy > /tmp/gcp_deploy.pub
+          chmod 644 /tmp/gcp_deploy.pub
+
+      - name: Get VM external IP
+        run: |
+          VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
+            --project=${{ env.PROJECT_ID }})
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+          echo "VM External IP: $VM_IP"
+
+      - name: Setup VM — Python + Docker + Neo4j
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 20
+          command: |
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --ssh-key-file=/tmp/gcp_deploy \
+              --strict-host-key-checking=no \
+              --command="
+                if ! command -v docker &> /dev/null; then
+                  sudo apt-get update -qq
+                  sudo apt-get install -y python3.11 python3.11-venv python3-pip git curl postgresql-client
+                  curl -fsSL https://get.docker.com | sudo sh
+                  sudo usermod -aG docker \$USER
+                  newgrp docker
+                fi
+
+                if ! docker ps 2>/dev/null | grep -q fraud_graph; then
+                  docker run -d \
+                    --name fraud_graph \
+                    --restart always \
+                    -p ${{ env.NEO4J_HTTP_PORT }}:7474 -p ${{ env.NEO4J_BOLT_PORT }}:7687 \
+                    -e NEO4J_AUTH=neo4j/$NEO4J_PASSWORD \
+                    -e NEO4J_server_memory_heap_initial__size=256m \
+                    -e NEO4J_server_memory_heap_max__size=512m \
+                    -e NEO4J_server_memory_pagecache_size=128m \
+                    -v neo4j_data:/data \
+                    neo4j:5.15-community 2>/dev/null || \
+                  docker start fraud_graph 2>/dev/null || true
+                fi
+                echo 'VM setup complete'
+              "
+
+      # ── Cloud SQL ────────────────────────────────────
+      - name: Create Cloud SQL instance (if not exists)
+        run: |
+          EXISTS=$(gcloud sql instances list \
+            --filter="name=${{ env.SQL_INSTANCE }}" \
+            --format="value(name)" 2>/dev/null)
+          if [ -z "$EXISTS" ]; then
+            echo "Creating Cloud SQL instance..."
+            gcloud sql instances create ${{ env.SQL_INSTANCE }} \
+              --database-version=POSTGRES_15 \
+              --tier=${{ env.SQL_TIER }} \
+              --region=${{ env.REGION }} \
+              --storage-type=SSD \
+              --storage-size=10GB \
+              --no-backup \
+              --authorized-networks=0.0.0.0/0 \
+              --project=${{ env.PROJECT_ID }}
+          else
+            echo "Cloud SQL already exists — skipping"
+          fi
+
+      # FIX 2: --quiet skips Y/n prompt
+      # FIX 3: 0.0.0.0/0 so GitHub runner + VM both can connect
+      - name: Set Cloud SQL password + authorize networks + create DB
+        run: |
+          gcloud sql users set-password postgres \
+            --instance=${{ env.SQL_INSTANCE }} \
+            --password=${{ secrets.SQL_ROOT_PASSWORD }} \
+            --project=${{ env.PROJECT_ID }}
+
+          SQL_IP=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} \
+            --format="value(ipAddresses[0].ipAddress)" \
+            --project=${{ env.PROJECT_ID }})
+          echo "SQL_IP=$SQL_IP" >> $GITHUB_ENV
+          echo "Cloud SQL IP: $SQL_IP"
+
+          gcloud sql instances patch ${{ env.SQL_INSTANCE }} \
+            --authorized-networks=0.0.0.0/0 \
+            --quiet \
+            --project=${{ env.PROJECT_ID }}
+
+          echo "Waiting 20s for network changes to apply..."
+          sleep 20
+
+          sudo apt-get install -y postgresql-client -qq
+
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres \
+            -c "CREATE DATABASE ${{ env.SQL_DB }};" 2>/dev/null || echo "DB already exists"
+
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres \
+            -c "CREATE USER ${{ env.SQL_USER }} WITH PASSWORD '$SQL_USER_PASSWORD';" 2>/dev/null || echo "User already exists"
+
+          # Grant fraud_user role to postgres so it can transfer ownership
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres \
+            -c "GRANT ${{ env.SQL_USER }} TO postgres;" 2>/dev/null || echo "Already granted"
+
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres \
+            -c "GRANT ALL PRIVILEGES ON DATABASE ${{ env.SQL_DB }} TO ${{ env.SQL_USER }};"
+
+          # Fix: grant schema public permissions — needed for CREATE TABLE
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres -d ${{ env.SQL_DB }} \
+            -c "GRANT ALL ON SCHEMA public TO ${{ env.SQL_USER }};"
+
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres -d ${{ env.SQL_DB }} \
+            -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${{ env.SQL_USER }};"
+
+          # Fix: postgres must be member of fraud_user role to transfer ownership
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres \
+            -c "GRANT ${{ env.SQL_USER }} TO postgres;"
+
+          PGPASSWORD=$SQL_ROOT_PASSWORD psql \
+            -h $SQL_IP -U postgres -d ${{ env.SQL_DB }} \
+            -c "ALTER DATABASE ${{ env.SQL_DB }} OWNER TO ${{ env.SQL_USER }};"
+
+          echo "DB + user + schema setup complete"
+
+      # ── Firewall Rules ───────────────────────────────
+      - name: Create firewall rules (if not exists)
+        run: |
+          gcloud compute firewall-rules describe allow-fraud-api \
+            --project=${{ env.PROJECT_ID }} 2>/dev/null || \
+          gcloud compute firewall-rules create allow-fraud-api \
+            --allow=tcp:${{ env.APP_PORT }} \
+            --target-tags=fraud-server \
+            --project=${{ env.PROJECT_ID }}
+
+          gcloud compute firewall-rules describe allow-neo4j \
+            --project=${{ env.PROJECT_ID }} 2>/dev/null || \
+          gcloud compute firewall-rules create allow-neo4j \
+            --allow=tcp:${{ env.NEO4J_HTTP_PORT }},tcp:${{ env.NEO4J_BOLT_PORT }} \
+            --target-tags=fraud-server \
+            --project=${{ env.PROJECT_ID }}
+
+  # ══════════════════════════════════════════════════════
+  # JOB 2 — Deploy Application Code
+  # ══════════════════════════════════════════════════════
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: provision
+    env:
+      APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+      JWT_SECRET_KEY: ${{ secrets.JWT_SECRET }}
+      SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      SQL_USER_PASSWORD: ${{ secrets.SQL_USER_PASSWORD }}
+      SQL_ROOT_PASSWORD: ${{ secrets.SQL_ROOT_PASSWORD }}
+      NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+      LINKEDIN_ACTOR_ID: ${{ secrets.LINKEDIN_ACTOR_ID }}
+      GOOGLE_SEARCH_ACTOR_ID: ${{ secrets.GOOGLE_SEARCH_ACTOR_ID }}
+      YOUTUBE_ACTOR_ID: ${{ secrets.YOUTUBE_ACTOR_ID }}
+
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      # FIX: SSH key written again — Job 2 is a fresh runner
+      - name: Setup SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ env.GCP_SSH_PRIVATE_KEY }}
+        run: |
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > /tmp/gcp_deploy
+          echo "" >> /tmp/gcp_deploy
+          chmod 600 /tmp/gcp_deploy
+          ssh-keygen -y -f /tmp/gcp_deploy > /tmp/gcp_deploy.pub
+          chmod 644 /tmp/gcp_deploy.pub
+
+      - name: Get IPs
+        run: |
+          SQL_IP=$(gcloud sql instances describe ${{ env.SQL_INSTANCE }} \
+            --format="value(ipAddresses[0].ipAddress)" \
+            --project=${{ env.PROJECT_ID }})
+          echo "SQL_IP=$SQL_IP" >> $GITHUB_ENV
+
+          VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
+            --project=${{ env.PROJECT_ID }})
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+
+      - name: Deploy code to VM
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: |
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --ssh-key-file=/tmp/gcp_deploy \
+              --strict-host-key-checking=no \
+              --command="
+                set -e
+                APP_DIR=\$HOME/${{ env.APP_DIR }}
+
+                if [ -d \"\$APP_DIR\" ]; then
+                  echo 'Pulling latest code...'
+                  cd \$APP_DIR && git pull origin main
+                else
+                  echo 'Cloning repo...'
+                  git clone https://$GH_PAT@github.com/${{ github.repository }}.git \$APP_DIR
+                fi
+
+                cd \$APP_DIR
+
+                # FIX 4: Use printf instead of heredoc — avoids YAML/SSH quoting issues
+                printf 'SERP_API_KEY=$SERP_API_KEY\n' >> .env
+                printf 'GOOGLE_API_KEY=$GOOGLE_API_KEY\n' >> .env
+                printf 'APIFY_API_TOKEN=$APIFY_API_TOKEN\n' >> .env
+                printf 'JWT_SECRET_KEY=$JWT_SECRET_KEY\n' >> .env
+                printf 'GEMINI_MODEL_NAME=gemini-2.5-flash\n' >> .env
+                printf 'GEMINI_TEMPERATURE=0\n' >> .env
+                printf 'DATABASE_URL=postgresql://${{ env.SQL_USER }}:$SQL_USER_PASSWORD@${{ env.SQL_IP }}:${{ env.SQL_PORT }}/${{ env.SQL_DB }}\n' >> .env
+               
+                printf 'NEO4J_USER=neo4j\n' >> .env
+                printf 'NEO4J_PASSWORD=$NEO4J_PASSWORD\n' >> .env
+                printf 'ANTHROPIC_MODEL=claude-sonnet-4-20250514\n' >> .env
+                printf 'APP_PORT=${{ env.APP_PORT }}\n' >> .env
+                printf 'ENV=production\n' >> .env
+                printf 'EXTERNAL_MODE=sample\n' >> .env
+                printf 'LOG_LEVEL=INFO\n' >> .env
+                printf 'DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE=600\n' >> .env
+                printf 'LINKEDIN_ACTOR_ID=$LINKEDIN_ACTOR_ID\n' >> .env
+                printf 'GOOGLE_SEARCH_ACTOR_ID=$GOOGLE_SEARCH_ACTOR_ID\n' >> .env
+                printf 'YOUTUBE_ACTOR_ID=$YOUTUBE_ACTOR_ID\n' >> .env
+
+                python3.11 -m venv venv 2>/dev/null || true
+                source venv/bin/activate
+                pip install --quiet --upgrade pip
+                pip install --quiet -r requirements.txt
+                pip install --quiet fastapi 'uvicorn[standard]' psycopg2-binary
+                echo 'Deploy done'
+              "
+
+      # FIX 5: Seed PostgreSQL runs on VM (VM has access to Cloud SQL via authorized network)
+      # SQL_IP is a GitHub env var — it gets substituted before SSH command runs
+      - name: Seed PostgreSQL
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 2
+          retry_wait_seconds: 10
+          command: |
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --ssh-key-file=/tmp/gcp_deploy \
+              --strict-host-key-checking=no \
+              --command="
+                set -e
+                APP_DIR=\$HOME/${{ env.APP_DIR }}
+                cd \$APP_DIR
+
+                if ! command -v psql &> /dev/null; then
+                  sudo apt-get install -y postgresql-client -qq
+                fi
+
+                # Check and seed data.sql (customers table existence)
+                DATA_SEEDED=\$(PGPASSWORD='$SQL_USER_PASSWORD' psql \
+                  -h ${{ env.SQL_IP }} \
+                  -p ${{ env.SQL_PORT }} \
+                  -U ${{ env.SQL_USER }} \
+                  -d ${{ env.SQL_DB }} \
+                  -t -c 'SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '\''customers'\'');' 2>/dev/null | tr -d ' ' || echo 'f')
+
+                if [ \"\$DATA_SEEDED\" = \"t\" ]; then
+                  echo \"data.sql already seeded (customers table exists) — skipping\"
+                else
+                  echo 'Seeding PostgreSQL from sql_file/data.sql...'
+                  PGPASSWORD='$SQL_USER_PASSWORD' psql \
+                    -h ${{ env.SQL_IP }} \
+                    -p ${{ env.SQL_PORT }} \
+                    -U ${{ env.SQL_USER }} \
+                    -d ${{ env.SQL_DB }} \
+                    -f backend/sql_file/data.sql
+                  echo 'data.sql seeded successfully'
+                fi
+
+                # Check and seed multi-user-schema.sql (users table existence)
+                SCHEMA_SEEDED=\$(PGPASSWORD='$SQL_USER_PASSWORD' psql \
+                  -h ${{ env.SQL_IP }} \
+                  -p ${{ env.SQL_PORT }} \
+                  -U ${{ env.SQL_USER }} \
+                  -d ${{ env.SQL_DB }} \
+                  -t -c 'SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '\''users'\'');' 2>/dev/null | tr -d ' ' || echo 'f')
+
+                if [ \"\$SCHEMA_SEEDED\" = \"t\" ]; then
+                  echo \"multi-user-schema.sql already seeded (users table exists) — skipping\"
+                else
+                  echo 'Seeding multi-user schema from sql_file/multi-user-schema.sql...'
+                  PGPASSWORD='$SQL_USER_PASSWORD' psql \
+                    -h ${{ env.SQL_IP }} \
+                    -p ${{ env.SQL_PORT }} \
+                    -U ${{ env.SQL_USER }} \
+                    -d ${{ env.SQL_DB }} \
+                    -f backend/sql_file/multi-user-schema.sql
+                  echo 'Multi-user schema seeded successfully'
+                fi
+              "
+
+      - name: Seed Neo4j
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 8
+          max_attempts: 2
+          retry_wait_seconds: 15
+          command: |
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --ssh-key-file=/tmp/gcp_deploy \
+              --strict-host-key-checking=no \
+              --command="
+                set -e
+                echo 'Checking Neo4j is ready...'
+                for i in \$(seq 1 10); do
+                  if docker exec fraud_graph cypher-shell \
+                    -u neo4j -p '$NEO4J_PASSWORD' \
+                    'RETURN 1;' > /dev/null 2>&1; then
+                    echo 'Neo4j is ready'
+                    break
+                  fi
+                  echo Waiting for Neo4j attempt \$i
+                  sleep 8
+                done
+
+                NODE_COUNT=\$(docker exec fraud_graph cypher-shell \
+                  -u neo4j -p '$NEO4J_PASSWORD' \
+                  --format plain \
+                  'MATCH (n) RETURN COUNT(n) AS count;' 2>/dev/null | tail -1 | tr -d ' ' || echo '0')
+
+                if [ \$NODE_COUNT -gt 10 ] 2>/dev/null; then
+                  echo Neo4j already seeded \$NODE_COUNT nodes -- skipping
+                else
+                  echo 'Seeding Neo4j from sql_file/neo4j_seed.cypher...'
+                  docker cp \$HOME/${{ env.APP_DIR }}/backend/sql_file/neo4j_seed.cypher \
+                    fraud_graph:/neo4j_seed.cypher
+                  docker exec fraud_graph cypher-shell \
+                    -u neo4j \
+                    -p '$NEO4J_PASSWORD' \
+                    --file /neo4j_seed.cypher
+                  echo 'Neo4j seeded successfully'
+                  docker exec fraud_graph cypher-shell \
+                    -u neo4j -p '$NEO4J_PASSWORD' \
+                    --format plain \
+                    'MATCH (n) RETURN labels(n)[0] AS label, COUNT(n) AS count ORDER BY count DESC;'
+                fi
+              "
+
+      - name: Start app service
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 10
+          command: |
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.ZONE }} \
+              --project=${{ env.PROJECT_ID }} \
+              --ssh-key-file=/tmp/gcp_deploy \
+              --strict-host-key-checking=no \
+              --command="
+                APP_DIR=\$HOME/${{ env.APP_DIR }}
+                USERNAME=\$(whoami)
+
+                sudo tee /etc/systemd/system/fraud-api.service > /dev/null << SERVICEEOF
+            [Unit]
+            Description=Verixa Fraud Analytics API
+            After=network.target docker.service
+            Requires=docker.service
+
+            [Service]
+            Type=simple
+            User=\$USERNAME
+            WorkingDirectory=\$APP_DIR
+            Environment=PATH=\$APP_DIR/venv/bin
+            ExecStart=\$APP_DIR/venv/bin/python app/api.py
+            Restart=always
+            RestartSec=10
+            StandardOutput=journal
+            StandardError=journal
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICEEOF
+
+                sudo systemctl daemon-reload
+                sudo systemctl enable fraud-api
+                sudo systemctl restart fraud-api
+                sleep 5
+                sudo systemctl status fraud-api --no-pager
+              "
+
+      - name: Health check
+        run: |
+          VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
+            --project=${{ env.PROJECT_ID }})
+
+          echo "App URL: http://$VM_IP:${{ env.APP_PORT }}"
+          echo "Waiting 15s for app to start..."
+          sleep 15
+
+          MAX_RETRIES=3
+          COUNT=0
+          until curl -sf "http://$VM_IP:${{ env.APP_PORT }}/api/validate/CUST_0042" > /dev/null; do
+            COUNT=$((COUNT+1))
+            if [ $COUNT -ge $MAX_RETRIES ]; then
+              echo "❌ Health check failed after $MAX_RETRIES attempts"
+              echo "Fetching logs from VM:"
+              gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --command='sudo journalctl -u fraud-api -n 100 --no-pager' --project=${{ env.PROJECT_ID }}
+              exit 1
+            fi
+            echo "Attempt $COUNT failed — retrying in 10s..."
+            sleep 10
+          done
+          echo "✅ Health check passed — app is live"
+
+      - name: Print deployment summary
+        run: |
+          VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+            --zone=${{ env.ZONE }} \
+            --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
+            --project=${{ env.PROJECT_ID }})
+          echo ""
+          echo "══════════════════════════════════════════"
+          echo "  ✅ DEPLOYMENT COMPLETE"
+          echo "══════════════════════════════════════════"
+          echo "  🌐 App URL  : http://$VM_IP:${{ env.APP_PORT }}"
+          echo "  🗄️  Neo4j   : http://$VM_IP:${{ env.NEO4J_HTTP_PORT }}"
+          echo "  📋 Logs     : journalctl -u fraud-api -f"
+          echo "══════════════════════════════════════════"

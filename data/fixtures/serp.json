@@ -1,0 +1,97 @@
+{
+ "Marcus Vellacott": {
+  "queries": {
+   "fraud scam arrested": [
+    {
+     "title": "Remittance agent questioned in fraud inquiry",
+     "snippet": "Marcus Vellacott was named in a fraud inquiry into rapid transfers through two remittance firms.",
+     "link": "https://news.example/35eb0ced",
+     "displayed_link": "news.example",
+     "position": 1
+    },
+    {
+     "title": "Fraud ring suspected behind burst of small payments",
+     "snippet": "Investigators say several accounts shared one device and one agent, Marcus Vellacott among them.",
+     "link": "https://news.example/44aa8a62",
+     "displayed_link": "news.example",
+     "position": 2
+    }
+   ],
+   "court case lawsuit": [
+    {
+     "title": "Lawsuit over unauthorised card payments",
+     "snippet": "A lawsuit names Marcus Vellacott in a dispute about unauthorised card payments.",
+     "link": "https://news.example/563b100b",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ],
+   "money laundering financial crime": [
+    {
+     "title": "Money laundering probe widens to remittance firms",
+     "snippet": "The probe examines whether structured payments were used to avoid reporting.",
+     "link": "https://news.example/bb95ba80",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ]
+  }
+ },
+ "Aleksander Brandt-Navarro": {
+  "queries": {
+   "fraud scam arrested": [
+    {
+     "title": "Official's offshore holdings questioned",
+     "snippet": "Aleksander Brandt-Navarro, a senior public official (fictional), faces questions about offshore holdings.",
+     "link": "https://news.example/f2f9f877",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ],
+   "court case lawsuit": [
+    {
+     "title": "Anti-corruption body opens case",
+     "snippet": "A case concerning undeclared assets was opened against Aleksander Brandt-Navarro.",
+     "link": "https://news.example/7e96fe5e",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ],
+   "money laundering financial crime": [
+    {
+     "title": "Financial crime unit reviews casino and FX payments",
+     "snippet": "Unusual payments to a casino and a foreign-exchange firm are under review.",
+     "link": "https://news.example/d97086e4",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ]
+  }
+ },
+ "Garrick Ionescu": {
+  "queries": {
+   "fraud scam arrested": [
+    {
+     "title": "Student account used to pass on funds",
+     "snippet": "Garrick Ionescu was reported as a possible money mule in a bank alert.",
+     "link": "https://news.example/c63a2f11",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ]
+  }
+ },
+ "Rasmus Valdivia": {
+  "queries": {
+   "court case lawsuit": [
+    {
+     "title": "Online seller faces refund complaints",
+     "snippet": "Many buyers filed complaints against the shop run by Rasmus Valdivia.",
+     "link": "https://news.example/01452463",
+     "displayed_link": "news.example",
+     "position": 1
+    }
+   ]
+  }
+ }
+}

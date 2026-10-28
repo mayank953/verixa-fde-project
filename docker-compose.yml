@@ -1,0 +1,33 @@
+# Verixa Bank: the two databases the application reads. Local only: ports are bound to 127.0.0.1.
+# Passwords are throwaway local values. Never reuse them anywhere else.
+services:
+  db:
+    image: postgres:15
+    container_name: verixa_db
+    environment:
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: fraud_db
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["verixa_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud_user -d fraud_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  graph:
+    image: neo4j:5.15-community
+    container_name: verixa_graph
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-password}
+      NEO4J_server_memory_heap_max__size: 512m
+    ports: ["127.0.0.1:7474:7474", "127.0.0.1:7687:7687"]
+    volumes: ["verixa_neo4j:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-password} 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+volumes:
+  verixa_pgdata:
+  verixa_neo4j:

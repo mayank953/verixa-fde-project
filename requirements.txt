@@ -1,0 +1,26 @@
+# Verixa Bank fraud analytics: every library pinned to the versions this project was tested with (Python 3.14; 3.11 or newer should work).
+# An unpinned install pulls MCP 2.x (the app does not start) and SQLAlchemy 2.1 (the SQL analyst silently fails). This file is the fix.
+langgraph==1.2.18
+langchain==1.4.7
+langchain-google-genai==4.4.2
+langchain-community==0.4.2
+langchain-core==1.7.0
+deepeval==4.3.1
+mcp==1.30.0
+neo4j==6.4.1
+httpx==0.28.1
+beautifulsoup4==4.15.0
+psycopg2-binary==2.9.13
+SQLAlchemy==2.0.55
+pytest==9.1.1
+pytest-asyncio==1.4.1
+python-dotenv==1.2.4
+pydantic==2.14.1
+fastapi==0.162.0
+structlog==26.1.0
+python-multipart==0.0.32
+PyJWT==2.15.1
+bcrypt==5.0.0
+reportlab==5.1.0
+apify-client==3.4.0
+uvicorn==0.54.0

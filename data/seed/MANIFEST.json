@@ -1,0 +1,14 @@
+{
+ "seed": 20261027,
+ "as_of": "2026-10-01 12:00:00",
+ "customers": 54,
+ "merchants": 20,
+ "transactions": 3426,
+ "chargebacks": 70,
+ "devices": 49,
+ "ip_addresses": 50,
+ "accounts": 82,
+ "graph_statements": 481,
+ "seed_sql_sha256": "b0cee9037dbbc63f",
+ "note": "Fictional data. Illustrative thresholds. Foreign-exchange rates are illustrative."
+}
